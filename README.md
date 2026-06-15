@@ -30,7 +30,7 @@ py ioc_yara_scanner.py self-test
 py ioc_yara_scanner.py preserve . --label pre-bitdefender --zip
 ```
 
-## Optional: To enable MalwareBazaar exports, get an Auth-Key, set:
+## Optional: To enable MalwareBazaar sample uploads/exports, get an Auth-Key (auth.abuse.ch), then set:
 
 ```bash
 setx MALWAREBAZAAR_AUTH_KEY "your_key_here"
