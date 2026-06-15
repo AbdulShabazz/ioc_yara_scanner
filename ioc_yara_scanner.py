@@ -786,6 +786,244 @@ def sha256_file(path: Path, chunk_bytes: int) -> str:
 
     return h.hexdigest()
 
+def sha256_existing_file(path: Path, chunk_bytes: int = 8 * 1024 * 1024) -> str:
+    return sha256_file(path, chunk_bytes)
+
+
+def is_relative_to_path(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def preserve_glob_match(path: Path, project_root: Path, patterns: list[str]) -> bool:
+    absolute_text = str(path)
+    try:
+        relative_text = str(path.resolve().relative_to(project_root.resolve()))
+    except ValueError:
+        relative_text = path.name
+
+    return glob_any(absolute_text, patterns) or glob_any(relative_text, patterns)
+
+
+def iter_preserve_files(
+    project_root: Path,
+    *,
+    output_root: Path,
+    exclude_globs: list[str],
+) -> Iterable[Path]:
+    project_root = project_root.resolve()
+    output_root = output_root.resolve()
+
+    if project_root.is_file():
+        if not preserve_glob_match(project_root, project_root.parent, exclude_globs):
+            yield project_root
+        return
+
+    for root, dirs, files in os.walk(str(project_root), followlinks=False):
+        root_path = Path(root)
+
+        dirs[:] = [
+            d for d in dirs
+            if not preserve_glob_match(root_path / d, project_root, exclude_globs)
+            and not is_relative_to_path(root_path / d, output_root)
+        ]
+
+        for name in files:
+            path = root_path / name
+
+            if is_relative_to_path(path, output_root):
+                continue
+
+            if preserve_glob_match(path, project_root, exclude_globs):
+                continue
+
+            if path.is_symlink():
+                continue
+
+            yield path
+
+
+def zip_directory(source_dir: Path, zip_path: Path) -> None:
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(
+        zip_path,
+        mode="w",
+        compression=zipfile.ZIP_DEFLATED,
+        allowZip64=True,
+    ) as zf:
+        for path in source_dir.rglob("*"):
+            if path.is_file():
+                zf.write(path, path.relative_to(source_dir))
+
+
+def preserve_project_snapshot(
+    config_path: Path,
+    project_root: Path,
+    *,
+    label: str = "",
+    make_zip: bool = False,
+) -> dict[str, Any]:
+    config = load_or_create_config(config_path)
+    data_dir = resolve_data_dir(config, config_path)
+    preserve_config = config.get("preserve", {})
+
+    raw_output_dir = expand_env_tokens(
+        str(preserve_config.get("output_dir", "%LOCALAPPDATA%\\PyIOCScanner\\snapshots"))
+    )
+    output_root = Path(raw_output_dir)
+
+    if not output_root.is_absolute():
+        output_root = data_dir / output_root
+
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    project_root = project_root.resolve()
+
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label.strip())[:64]
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    snapshot_name = f"{stamp}_{safe_label}" if safe_label else stamp
+
+    snapshot_dir = output_root / snapshot_name
+    files_dir = snapshot_dir / "files"
+    manifest_path = snapshot_dir / "manifest.json"
+
+    files_dir.mkdir(parents=True, exist_ok=False)
+
+    exclude_globs = list(preserve_config.get("exclude_globs", []))
+
+    manifest: dict[str, Any] = {
+        "schema": 1,
+        "type": "project_preservation_snapshot",
+        "created_utc": utc_now(),
+        "project_root": str(project_root),
+        "config_path": str(config_path.resolve()),
+        "data_dir": str(data_dir),
+        "snapshot_dir": str(snapshot_dir),
+        "files_dir": str(files_dir),
+        "label": label,
+        "files": [],
+        "errors": [],
+    }
+
+    copied = 0
+    total_bytes = 0
+
+    for src in iter_preserve_files(
+        project_root,
+        output_root=output_root,
+        exclude_globs=exclude_globs,
+    ):
+        try:
+            relative = src.resolve().relative_to(project_root)
+            dst = files_dir / relative
+            dst.parent.mkdir(parents=True, exist_ok=True)
+
+            src_hash = sha256_existing_file(src)
+            shutil.copy2(src, dst)
+            dst_hash = sha256_existing_file(dst)
+
+            stat = src.stat()
+
+            entry = {
+                "relative_path": str(relative),
+                "source_path": str(src),
+                "snapshot_path": str(dst),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "sha256": src_hash,
+                "copy_sha256": dst_hash,
+                "verified": src_hash == dst_hash,
+            }
+
+            manifest["files"].append(entry)
+            copied += 1
+            total_bytes += stat.st_size
+
+            if src_hash != dst_hash:
+                manifest["errors"].append(
+                    {
+                        "path": str(src),
+                        "error": "copy hash mismatch",
+                    }
+                )
+
+        except Exception as exc:
+            manifest["errors"].append(
+                {
+                    "path": str(src),
+                    "error": str(exc),
+                }
+            )
+
+    if bool(preserve_config.get("copy_config", True)) and config_path.exists():
+        try:
+            config_dst = snapshot_dir / "scanner_config.json"
+            shutil.copy2(config_path, config_dst)
+            manifest["scanner_config_copy"] = {
+                "path": str(config_dst),
+                "sha256": sha256_existing_file(config_dst),
+            }
+        except Exception as exc:
+            manifest["errors"].append(
+                {
+                    "path": str(config_path),
+                    "error": f"config copy failed: {exc}",
+                }
+            )
+
+    if bool(preserve_config.get("copy_data_dir_metadata", True)):
+        for metadata_name in ("state.json", "ioc_hashes.sqlite3"):
+            src = data_dir / metadata_name
+
+            if not src.exists():
+                continue
+
+            try:
+                dst = snapshot_dir / "data_dir_metadata" / metadata_name
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                manifest.setdefault("data_dir_metadata", []).append(
+                    {
+                        "name": metadata_name,
+                        "path": str(dst),
+                        "sha256": sha256_existing_file(dst),
+                    }
+                )
+            except Exception as exc:
+                manifest["errors"].append(
+                    {
+                        "path": str(src),
+                        "error": f"metadata copy failed: {exc}",
+                    }
+                )
+
+    manifest["summary"] = {
+        "files_copied": copied,
+        "total_bytes": total_bytes,
+        "errors": len(manifest["errors"]),
+    }
+
+    write_json(manifest_path, manifest)
+
+    manifest_hash = sha256_existing_file(manifest_path)
+    manifest["manifest_path"] = str(manifest_path)
+    manifest["manifest_sha256"] = manifest_hash
+
+    write_json(manifest_path, manifest)
+
+    if make_zip:
+        zip_path = output_root / f"{snapshot_name}.zip"
+        zip_directory(snapshot_dir, zip_path)
+        manifest["zip_path"] = str(zip_path)
+        manifest["zip_sha256"] = sha256_existing_file(zip_path)
+        write_json(manifest_path, manifest)
+
+    return manifest
+
 def shannon_entropy(data: bytes) -> float:
     if not data:
         return 0.0
@@ -1349,6 +1587,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--print-clean", action="store_true")
     p_watch.add_argument("--jsonl", help="Append full scan events to JSONL file.")
 
+    p_preserve = sub.add_parser(
+        "preserve",
+        help="Create a verified project snapshot before re-enabling security software.",
+    )
+    p_preserve.add_argument("project_root", help="Project directory or file to preserve.")
+    p_preserve.add_argument("--label", default="pre-bitdefender", help="Snapshot label.")
+    p_preserve.add_argument("--zip", action="store_true", help="Also create a ZIP copy.")
+
     sub.add_parser("self-test", help="Create and scan a benign YARA self-test file.")
 
     return parser
@@ -1408,6 +1654,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             options=options,
         )
         return 0
+
+    if args.command == "preserve":
+        manifest = preserve_project_snapshot(
+            config_path=config_path,
+            project_root=Path(args.project_root).resolve(),
+            label=str(args.label),
+            make_zip=bool(args.zip),
+        )
+
+        print(json.dumps(manifest, indent=2))
+
+        return 1 if manifest.get("summary", {}).get("errors", 0) else 0
 
     if args.command == "self-test":
         return run_self_test(config_path)
