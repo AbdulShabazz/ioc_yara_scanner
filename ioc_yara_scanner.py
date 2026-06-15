@@ -21,6 +21,7 @@ import fnmatch
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -36,16 +37,31 @@ from typing import Any, Iterable, Optional
 
 SHA256_RE = re.compile(r"\b[a-fA-F0-9]{64}\b")
 
-
+"""
+1. scan_extensions empty means scan all files. Do not restrict extensions if you want packed binaries scanned.
+2. Packed executable policy:
+            "annotate"   = report packed signal, do not alter verdict
+            "suspicious" = mark likely-packed PE files as suspicious
+            "ignore"     = disable packed-binary verdict logic
+"""
 DEFAULT_CONFIG: dict[str, Any] = {
     "schema": 1,
     "data_dir": "%LOCALAPPDATA%\\PyIOCScanner",
     "user_agent": "pyioc-scanner/0.1 defensive-research",
     "scan": {
-        "max_file_mb": 128,
-        "yara_timeout_sec": 30,
+        "max_file_mb": 5124,
+        "yara_timeout_sec": 300,
         "hash_chunk_mb": 4,
+        
         "scan_extensions": [],
+
+        "packed_binary_policy": "annotate",
+
+        "inspect_pe_sections": True,
+        "packed_entropy_threshold": 7.2,
+        "packed_min_section_bytes": 4096,
+        "packed_min_high_entropy_sections": 1,
+
         "exclude_globs": [
             "*\\System Volume Information\\*",
             "*\\$Recycle.Bin\\*",
@@ -770,6 +786,175 @@ def sha256_file(path: Path, chunk_bytes: int) -> str:
 
     return h.hexdigest()
 
+def shannon_entropy(data: bytes) -> float:
+    if not data:
+        return 0.0
+
+    counts = [0] * 256
+
+    for b in data:
+        counts[b] += 1
+
+    total = len(data)
+    entropy = 0.0
+
+    for count in counts:
+        if count == 0:
+            continue
+
+        p = count / total
+        entropy -= p * math.log2(p)
+
+    return entropy
+
+
+def _read_u16_le(buf: bytes, offset: int) -> int:
+    return int.from_bytes(buf[offset:offset + 2], "little", signed=False)
+
+
+def _read_u32_le(buf: bytes, offset: int) -> int:
+    return int.from_bytes(buf[offset:offset + 4], "little", signed=False)
+
+
+def pe_section_entropies(
+    path: Path,
+    *,
+    max_section_sample_bytes: int = 8 * 1024 * 1024,
+) -> list[dict[str, Any]]:
+    """
+    Minimal Portable Executable (PE) section parser.
+
+    Does not execute, load, emulate, unpack, or modify the file.
+    Only reads section table metadata and samples raw section bytes.
+    """
+    sections: list[dict[str, Any]] = []
+
+    try:
+        with path.open("rb") as f:
+            dos = f.read(64)
+
+            if len(dos) < 64 or dos[0:2] != b"MZ":
+                return sections
+
+            pe_offset = _read_u32_le(dos, 0x3C)
+
+            if pe_offset <= 0 or pe_offset > 256 * 1024 * 1024:
+                return sections
+
+            f.seek(pe_offset)
+            pe_header = f.read(24)
+
+            if len(pe_header) < 24 or pe_header[0:4] != b"PE\x00\x00":
+                return sections
+
+            number_of_sections = _read_u16_le(pe_header, 6)
+            size_of_optional_header = _read_u16_le(pe_header, 20)
+
+            if number_of_sections <= 0 or number_of_sections > 128:
+                return sections
+
+            section_table_offset = pe_offset + 24 + size_of_optional_header
+            f.seek(section_table_offset)
+
+            for _ in range(number_of_sections):
+                header = f.read(40)
+
+                if len(header) < 40:
+                    break
+
+                raw_name = header[0:8].split(b"\x00", 1)[0]
+                name = raw_name.decode("ascii", errors="replace")
+
+                virtual_size = _read_u32_le(header, 8)
+                raw_size = _read_u32_le(header, 16)
+                raw_ptr = _read_u32_le(header, 20)
+
+                if raw_size == 0:
+                    sections.append(
+                        {
+                            "name": name,
+                            "virtual_size": virtual_size,
+                            "raw_size": raw_size,
+                            "raw_ptr": raw_ptr,
+                            "entropy": 0.0,
+                        }
+                    )
+                    continue
+
+                current = f.tell()
+
+                try:
+                    f.seek(raw_ptr)
+                    sample = f.read(min(raw_size, max_section_sample_bytes))
+                    entropy = shannon_entropy(sample)
+                finally:
+                    f.seek(current)
+
+                sections.append(
+                    {
+                        "name": name,
+                        "virtual_size": virtual_size,
+                        "raw_size": raw_size,
+                        "raw_ptr": raw_ptr,
+                        "entropy": round(entropy, 4),
+                    }
+                )
+
+    except OSError:
+        return sections
+
+    return sections
+
+
+def detect_packed_binary(path: Path, scan_config: dict[str, Any]) -> dict[str, Any]:
+    """
+    Packed PE heuristic.
+
+    High entropy does not prove malware. It is a triage signal:
+      - packer
+      - encrypted payload
+      - compressed installer
+      - protected commercial software
+      - self-extracting archive
+    """
+    result: dict[str, Any] = {
+        "is_pe": False,
+        "packed_suspected": False,
+        "reason": "",
+        "high_entropy_sections": [],
+        "sections": [],
+    }
+
+    if not bool(scan_config.get("inspect_pe_sections", True)):
+        return result
+
+    sections = pe_section_entropies(path)
+    result["sections"] = sections
+
+    if not sections:
+        return result
+
+    result["is_pe"] = True
+
+    threshold = float(scan_config.get("packed_entropy_threshold", 7.2))
+    min_section_bytes = int(scan_config.get("packed_min_section_bytes", 4096))
+    min_high_sections = int(scan_config.get("packed_min_high_entropy_sections", 1))
+
+    high_entropy_sections = [
+        s for s in sections
+        if int(s.get("raw_size", 0)) >= min_section_bytes
+        and float(s.get("entropy", 0.0)) >= threshold
+    ]
+
+    result["high_entropy_sections"] = high_entropy_sections
+
+    if len(high_entropy_sections) >= min_high_sections:
+        result["packed_suspected"] = True
+        result["reason"] = (
+            f"{len(high_entropy_sections)} PE section(s) have entropy >= {threshold}"
+        )
+
+    return result
 
 def file_allowed_by_extension(path: Path, scan_extensions: list[str]) -> bool:
     if not scan_extensions:
