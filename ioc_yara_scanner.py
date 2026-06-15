@@ -51,11 +51,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "scan": {
         "max_file_mb": 5124,
         "yara_timeout_sec": 300,
-        "hash_chunk_mb": 4,
+        "hash_chunk_mb": 16,
         
         "scan_extensions": [],
 
-        "packed_binary_policy": "annotate",
+        "packed_binary_policy": "suspicious",
 
         "inspect_pe_sections": True,
         "packed_entropy_threshold": 7.2,
@@ -1059,6 +1059,13 @@ class Scanner:
             "sha256": None,
             "hash_hits": [],
             "yara_matches": [],
+            "packed_binary": {
+                "is_pe": False,
+                "packed_suspected": False,
+                "reason": "",
+                "high_entropy_sections": [],
+                "sections": [],
+            },
             "errors": [],
         }
 
@@ -1078,6 +1085,8 @@ class Scanner:
             if self.options.use_hashes:
                 event["hash_hits"] = self.hash_db.lookup(sha256)
 
+            event["packed_binary"] = detect_packed_binary(path, self.scan_config)
+
             if self.yara_manager is not None:
                 yara_matches, yara_errors = self.yara_manager.match_file(
                     path,
@@ -1087,9 +1096,18 @@ class Scanner:
                 event["yara_matches"] = yara_matches
                 event["errors"].extend(yara_errors)
 
+            packed_policy = str(
+                self.scan_config.get("packed_binary_policy", "annotate")
+            ).lower()
+
             if event["hash_hits"]:
                 event["verdict"] = "malicious"
             elif event["yara_matches"]:
+                event["verdict"] = "suspicious"
+            elif (
+                packed_policy == "suspicious"
+                and event["packed_binary"].get("packed_suspected")
+            ):
                 event["verdict"] = "suspicious"
             else:
                 event["verdict"] = "clean"
@@ -1161,6 +1179,19 @@ def print_event_compact(event: dict[str, Any]) -> None:
 
     for hit in event.get("hash_hits", []):
         print(f"  hash-hit: {hit.get('source')}")
+
+    packed = event.get("packed_binary", {})
+
+    if packed.get("packed_suspected"):
+        print(f"  packed: {packed.get('reason')}")
+
+        for section in packed.get("high_entropy_sections", []):
+            print(
+                "    section: "
+                f"{section.get('name')} "
+                f"entropy={section.get('entropy')} "
+                f"raw_size={section.get('raw_size')}"
+            )
 
     for match in event.get("yara_matches", []):
         tags = ",".join(match.get("tags", []))
