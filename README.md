@@ -18,7 +18,7 @@ py ioc_yara_scanner.py init-config
 py ioc_yara_scanner.py update
 
 # 4. Scan a directory:
-py ioc_yara_scanner.py scan "C:\Users\Abdul\Downloads"
+py ioc_yara_scanner.py scan "C:\Users\AbdulShabazz\Downloads"
 
 # 5. Watch a directory and live-update feeds:
 py ioc_yara_scanner.py watch "C:\Users\Abdul\Downloads" --interval 10 --update-interval-min 60
